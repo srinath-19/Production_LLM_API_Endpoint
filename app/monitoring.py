@@ -116,14 +116,31 @@ class MetricsCollector:
 # === Request Timer (utility) ===
 
 class RequestTimer:
-    """Context manager for timing requests."""
+    """
+    Context manager for timing requests.
+
+    `elapsed_ms` is readable *inside* the block too, where it reports time so
+    far. That matters on error paths, which record metrics and then raise
+    before the block ever exits. Once the block closes, the value is frozen.
+    """
+
+    def __init__(self):
+        self.start = time.time()
+        self._elapsed_ms = None
 
     def __enter__(self):
         self.start = time.time()
+        self._elapsed_ms = None
         return self
 
     def __exit__(self, *args):
-        self.elapsed_ms = (time.time() - self.start) * 1000
+        self._elapsed_ms = (time.time() - self.start) * 1000
+
+    @property
+    def elapsed_ms(self) -> float:
+        if self._elapsed_ms is not None:
+            return self._elapsed_ms
+        return (time.time() - self.start) * 1000
         
         
 # uv run python -c "
