@@ -24,9 +24,12 @@ COPY --chown=appuser:appuser app/ app/
 # Expose port
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+# Health check.
+# python:3.12-slim ships without curl, so probe with the stdlib instead of
+# installing a package just to make the healthcheck pass. urlopen raises a
+# non-zero exit on any 4xx/5xx or connection failure, which is what we want.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"]
 
 # Run uvicorn directly from venv (avoids uv re-syncing at runtime)
 CMD [".venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
