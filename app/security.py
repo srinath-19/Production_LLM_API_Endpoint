@@ -16,30 +16,75 @@ class InputSanitizer:
     Detects prompt injection patterns and cleans dangerous content.
     """
 
+    # Each pattern is (rule_name, regex).
+    #
+    # These target the *shape of an attack*, not individual keywords. Matching
+    # a bare keyword like "system prompt" blocks ordinary developer questions
+    # ("how do I write a good system prompt?"), so every rule below requires a
+    # verb or structure that only makes sense as an override attempt.
     INJECTION_PATTERNS = [
-        r"ignore\s+(all\s+)?previous\s+instructions",
-        r"forget\s+(all\s+)?previous",
-        r"new\s+instructions\s*:",
-        r"system\s*prompt",
-        r"---\s*end\s*(of)?\s*prompt",
-        r"pretend\s+you\s+are",
-        r"act\s+as\s+(if\s+)?you",
-        r"bypass\s+(all\s+)?restrictions",
-        r"reveal\s+(your|the)\s+(system|instructions|prompt)",
-        r"you\s+are\s+now\s+(DAN|jailbroken)",
+        # --- Instruction override ---
+        (
+            "instruction_override",
+            r"\b(ignore|disregard|forget|discard|override)\s+"
+            r"(all\s+|any\s+|the\s+|your\s+|of\s+)*"
+            r"(previous|prior|above|earlier|preceding|initial|original)\s+"
+            r"(instructions?|prompts?|rules?|directions?|context)",
+        ),
+        ("new_instructions", r"\bnew\s+instructions?\s*[:\-]"),
+        # --- System prompt / instruction extraction ---
+        (
+            "prompt_extraction",
+            r"\b(reveal|show|repeat|print|output|display|expose|leak|reproduce|"
+            r"give\s+me|tell\s+me)\s+(me\s+)?(your|the)\s+"
+            r"(system\s+|initial\s+|original\s+|hidden\s+|full\s+)*"
+            r"(prompt|instructions?|rules?|directive)",
+        ),
+        (
+            "prompt_interrogation",
+            r"\bwhat\s+(is|are|was|were)\s+(your|the)\s+"
+            r"(exact\s+|system\s+|initial\s+|original\s+|hidden\s+)*"
+            r"(prompt|instructions?)\b",
+        ),
+        ("repeat_context", r"\brepeat\s+(everything\s+)?(above|before|verbatim)\b"),
+        # --- Delimiter / context-boundary spoofing ---
+        ("delimiter_spoof", r"[-=]{3,}\s*end\s+(of\s+)?(the\s+)?(prompt|system|instructions?)"),
+        ("tag_spoof", r"<\s*/?\s*(system|assistant|instructions?)\s*>"),
+        # --- Guardrail bypass / jailbreak personas ---
+        (
+            "bypass_guardrails",
+            r"\b(bypass|ignore|disable|turn\s+off|remove|circumvent)\s+"
+            r"(all\s+|any\s+|your\s+|the\s+)*"
+            r"(restrictions?|filters?|guardrails?|safeguards?|safety|content\s+polic)",
+        ),
+        (
+            "jailbreak_persona",
+            r"\b(you\s+are\s+now|act\s+as|acting\s+as|pretend\s+to\s+be|"
+            r"pretend\s+you\s+are|roleplay\s+as|simulate\s+being)\s+"
+            r"(dan\b|stan\b|jailbroken|unrestricted|an?\s+(unrestricted|unfiltered|"
+            r"uncensored|amoral)\b)",
+        ),
+        ("no_restrictions", r"\byou\s+(now\s+)?(have|has)\s+no\s+(restrictions?|filters?|rules?|guardrails?|limits)"),
+        ("developer_mode", r"\bdeveloper\s+mode\s+(enabled|on|activated)\b"),
     ]
 
     def __init__(self):
-        self.patterns = [re.compile(p, re.IGNORECASE) for p in self.INJECTION_PATTERNS]
+        self.patterns = [
+            (name, re.compile(p, re.IGNORECASE)) for name, p in self.INJECTION_PATTERNS
+        ]
 
     def check(self, text: str) -> tuple[bool, Optional[str]]:
         """
         Check if input is safe.
         Returns: (is_safe, rejection_reason)
+
+        The reason names the rule that fired. It is for server-side logs only -
+        the API returns a generic message so probing clients learn nothing
+        about which rule they tripped.
         """
-        for pattern in self.patterns:
+        for name, pattern in self.patterns:
             if pattern.search(text):
-                return False, "Blocked: potential prompt injection detected"
+                return False, f"Blocked: potential prompt injection detected (rule: {name})"
         return True, None
 
     def clean(self, text: str) -> str:
