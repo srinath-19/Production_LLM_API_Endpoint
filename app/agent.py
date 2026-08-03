@@ -3,6 +3,7 @@ LangGraph Agent with Production Error Handling
 Retry logic, model fallback, and structured state management.
 """
 
+import asyncio
 from typing import Optional
 from typing_extensions import TypedDict, Annotated
 from langgraph.graph import StateGraph, START, END
@@ -59,10 +60,10 @@ class ProductionAgent:
     def _build_graph(self):
         """Build the LangGraph state machine."""
 
-        def process_message(state: AgentState) -> dict:
+        async def process_message(state: AgentState) -> dict:
             """Try to process the message with the primary model."""
             try:
-                response = self.primary_llm.invoke(state["messages"])
+                response = await self.primary_llm.ainvoke(state["messages"])
                 return {
                     "messages": [response],
                     "error": None,
@@ -75,10 +76,10 @@ class ProductionAgent:
                     "model_used": "",
                 }
 
-        def try_fallback(state: AgentState) -> dict:
+        async def try_fallback(state: AgentState) -> dict:
             """Fallback to secondary model."""
             try:
-                response = self.fallback_llm.invoke(state["messages"])
+                response = await self.fallback_llm.ainvoke(state["messages"])
                 return {
                     "messages": [response],
                     "error": None,
@@ -91,7 +92,13 @@ class ProductionAgent:
                 }
 
         def handle_error(state: AgentState) -> dict:
-            """Return a graceful error message."""
+            """
+            Return a graceful error message.
+
+            The error is deliberately left on the state so the caller can tell
+            this apart from a real answer - otherwise a total model outage
+            looks like a successful request to metrics and to the cache.
+            """
             return {
                 "messages": [
                     AIMessage(content=(
@@ -100,6 +107,7 @@ class ProductionAgent:
                     ))
                 ],
                 "model_used": "error_handler",
+                "error": state.get("error") or "agent failed with no error recorded",
             }
 
         def route_after_process(state: AgentState) -> str:
@@ -141,12 +149,17 @@ class ProductionAgent:
         return graph.compile()
 
     @traceable(name="production_agent_invoke")
-    def invoke(self, message: str) -> dict:
+    async def ainvoke(self, message: str) -> dict:
         """
-        Invoke the agent with a user message.
+        Invoke the agent with a user message, without blocking the event loop.
+
+        This is the method the API uses. The graph nodes await the model
+        client directly, so a slow model call suspends only this request
+        rather than stalling every other connection on the worker.
+
         Returns: {"response": str, "model_used": str, "error": str | None}
         """
-        result = self.graph.invoke({
+        result = await self.graph.ainvoke({
             "messages": [HumanMessage(content=message)],
             "error": None,
             "retry_count": 0,
@@ -158,3 +171,12 @@ class ProductionAgent:
             "model_used": result.get("model_used", "unknown"),
             "error": result.get("error"),
         }
+
+    def invoke(self, message: str) -> dict:
+        """
+        Synchronous wrapper around `ainvoke`, for scripts and the REPL.
+
+        Do not call this from inside a running event loop - asyncio.run will
+        refuse. Server code should await `ainvoke` instead.
+        """
+        return asyncio.run(self.ainvoke(message))
