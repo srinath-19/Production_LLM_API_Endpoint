@@ -11,8 +11,6 @@ Wires together:
 - Health checks
 """
 
-import time
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
@@ -26,7 +24,7 @@ from dotenv import load_dotenv
 from app.config import get_settings
 from app.models import (
     ChatRequest, ChatResponse,
-    HealthResponse, MetricsResponse, ErrorResponse,
+    HealthResponse, MetricsResponse,
 )
 from app.security import SecurityPipeline
 from app.cache import ResponseCache
@@ -65,7 +63,10 @@ async def lifespan(app: FastAPI):
 
     # Initialize components
     security = SecurityPipeline()
-    cache = ResponseCache(ttl_seconds=settings.cache_ttl_seconds)
+    cache = ResponseCache(
+        ttl_seconds=settings.cache_ttl_seconds,
+        max_size=settings.cache_max_size,
+    )
     metrics = MetricsCollector()
     agent = ProductionAgent()
 
@@ -75,10 +76,22 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down...", extra={"extra_data": metrics.summary})
-    
-    
-    # === Rate Limiter Setup ===
+
+
+# === Rate Limiter Setup ===
 limiter = Limiter(key_func=get_remote_address)
+
+
+def _rate_limit() -> str:
+    """
+    Resolve the rate limit lazily.
+
+    slowapi accepts a callable here, which matters: reading settings at
+    decoration time would run at import, so a missing OPENAI_API_KEY would
+    crash the module before the app object even exists (breaking CI and any
+    test that merely imports app.main).
+    """
+    return get_settings().rate_limit
 
 # === FastAPI App ===
 app = FastAPI(
@@ -112,7 +125,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 # =============================================
 
 @app.post("/chat", response_model=ChatResponse)
-@limiter.limit(get_settings().rate_limit)
+@limiter.limit(_rate_limit)
 @traceable(name="chat_endpoint")
 async def chat(request: Request, body: ChatRequest):
     """
@@ -160,17 +173,38 @@ async def chat(request: Request, body: ChatRequest):
             )
 
         # ---- Step 3: Invoke LangGraph Agent ----
+        # Awaited, not called synchronously: the model round-trip is the
+        # slowest thing this endpoint does, and blocking on it here would
+        # stall the event loop for every other in-flight request.
         try:
-            result = agent.invoke(cleaned_message)
+            result = await agent.ainvoke(cleaned_message)
         except Exception as e:
             logger.error(f"Agent invocation failed: {e}", extra={"extra_data": {
                 "thread_id": body.thread_id,
                 "error": str(e),
             }})
-            metrics.record_request(latency_ms=0, error=True)
+            metrics.record_request(latency_ms=timer.elapsed_ms, error=True)
             raise HTTPException(
                 status_code=500,
                 detail="An error occurred while processing your request."
+            )
+
+        # The graph catches model failures internally and returns a polite
+        # message rather than raising. Treat that as the failure it is, so it
+        # is counted in error_rate and never written to the cache.
+        if result.get("error"):
+            logger.error("Agent exhausted all models", extra={"extra_data": {
+                "thread_id": body.thread_id,
+                "error": result["error"],
+                "model_used": result.get("model_used"),
+            }})
+            metrics.record_request(latency_ms=timer.elapsed_ms, error=True)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "I'm sorry, I'm having trouble processing your request "
+                    "right now. Please try again in a moment."
+                ),
             )
 
         response_text = result["response"]
