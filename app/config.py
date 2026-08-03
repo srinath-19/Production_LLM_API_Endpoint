@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     rate_limit: str = "20/minute"
     cache_ttl_seconds: int = 300
+    cache_max_size: int = 1000
     max_retries: int = 3
     
     
